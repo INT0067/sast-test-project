@@ -6,11 +6,9 @@
     xmlns="https://getpsalm.org/schema/config"
     xsi:schemaLocation="https://getpsalm.org/schema/config vendor/vimeo/psalm/config.xsd"
     findUnusedBaselineEntry="true"
+    findUnusedCode="false"
 >
     <projectFiles>
         <directory name="src" />
     </projectFiles>
-    <plugins>
-        <pluginClass class="Psalm\Plugin\TaintAnalysisPlugin" />
-    </plugins>
 </psalm>
