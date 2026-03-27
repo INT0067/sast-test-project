@@ -80,10 +80,21 @@ jobs:
             gosec -fmt json -out "gosec-${dir//\//-}.json" "./${dir}/..." || EXIT_CODE=1
             echo "::endgroup::"
           done
-          # Convert JSON results to GitHub annotations
+          # Debug: show raw JSON output
           for f in gosec-*.json; do
             [ -f "$f" ] || continue
+            echo "=== $f ==="
+            cat "$f"
+            echo ""
+            echo "=== Issues count ==="
+            jq '.Issues | length' "$f"
             jq -r '.Issues[]? | "::warning file=\(.file),line=\(.line)::GoSec [\(.rule_id)] \(.details)"' "$f"
+          done
+          # Show golang errors if any
+          for f in gosec-*.json; do
+            [ -f "$f" ] || continue
+            echo "=== Go Errors ==="
+            jq '.GolangErrors' "$f"
           done
           exit $EXIT_CODE
 
