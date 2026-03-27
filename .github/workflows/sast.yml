@@ -95,13 +95,38 @@ jobs:
             cd "$GITHUB_WORKSPACE"
             echo "::endgroup::"
           done
-          # Show findings as GitHub annotations
+          # Build PR comment
+          COMMENT="## GoSec Scan Results\n\n"
+          TOTAL=0
           for f in gosec-*.json; do
             [ -f "$f" ] || continue
-            echo "=== Issues found: $(jq '.Issues | length' "$f") ==="
+            COUNT=$(jq '.Issues | length' "$f")
+            TOTAL=$((TOTAL + COUNT))
+            if [ "$COUNT" -gt 0 ]; then
+              ISSUES=$(jq -r '.Issues[]? | "| `\(.file)` | \(.line) | \(.rule_id) | \(.severity) | \(.details) |"' "$f")
+              COMMENT="${COMMENT}${ISSUES}\n"
+            fi
+          done
+          if [ "$TOTAL" -gt 0 ]; then
+            HEADER="| File | Line | Rule | Severity | Details |\n|---|---|---|---|---|\n"
+            COMMENT="## GoSec Scan Results\n\n**$TOTAL issue(s) found**\n\n${HEADER}${ISSUES}\n"
+          else
+            COMMENT="## GoSec Scan Results\n\nNo issues found."
+          fi
+          echo -e "$COMMENT" > gosec-comment.md
+          # Also show as annotations
+          for f in gosec-*.json; do
+            [ -f "$f" ] || continue
             jq -r '.Issues[]? | "::warning file=\(.file),line=\(.line)::GoSec [\(.rule_id)] \(.details)"' "$f"
           done
           exit $EXIT_CODE
+
+      - name: Comment GoSec results on PR
+        if: always() && steps.changed.outputs.skip == 'false'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: gosec-results
+          path: gosec-comment.md
 
   psalm:
     name: Psalm Taint Analysis (PHP specialist)
@@ -143,8 +168,31 @@ jobs:
         run: |
           vendor/bin/psalm \
             --taint-analysis \
-            --output-format=github \
-            $(cat ../changed_php_files.txt | sed 's|php-app/||g' | tr '\n' ' ')
+            --output-format=json \
+            $(cat ../changed_php_files.txt | sed 's|php-app/||g' | tr '\n' ' ') > psalm-results.json 2>&1 || true
+          # Build PR comment
+          if [ -f psalm-results.json ] && jq -e '.issues' psalm-results.json > /dev/null 2>&1; then
+            COUNT=$(jq '.issues | length' psalm-results.json)
+            if [ "$COUNT" -gt 0 ]; then
+              HEADER="## Psalm Taint Analysis Results\n\n**$COUNT issue(s) found**\n\n| File | Line | Type | Message |\n|---|---|---|---|\n"
+              ROWS=$(jq -r '.issues[]? | "| `\(.file_name)` | \(.line_from) | \(.type) | \(.message) |"' psalm-results.json)
+              echo -e "${HEADER}${ROWS}\n" > ../psalm-comment.md
+              # Also print for log
+              jq -r '.issues[]? | "::error file=\(.file_name),line=\(.line_from)::\(.type): \(.message)"' psalm-results.json
+              exit 1
+            else
+              echo -e "## Psalm Taint Analysis Results\n\nNo issues found." > ../psalm-comment.md
+            fi
+          else
+            echo -e "## Psalm Taint Analysis Results\n\nNo issues found." > ../psalm-comment.md
+          fi
+
+      - name: Comment Psalm results on PR
+        if: always() && steps.changed.outputs.skip == 'false'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: psalm-results
+          path: psalm-comment.md
 
   trivy:
     name: Trivy (Dependency CVEs)
