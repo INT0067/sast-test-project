@@ -144,7 +144,7 @@ jobs:
           vendor/bin/psalm \
             --taint-analysis \
             --output-format=github \
-            $(cat ../changed_php_files.txt | sed 's|php-app/||g' | tr '\n' ' ') || true
+            $(cat ../changed_php_files.txt | sed 's|php-app/||g' | tr '\n' ' ')
 
   trivy:
     name: Trivy (Dependency CVEs)
