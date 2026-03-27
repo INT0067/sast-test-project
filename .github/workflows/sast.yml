@@ -35,7 +35,7 @@ jobs:
 
       - name: Upload results
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: semgrep-results.sarif
           category: semgrep
@@ -73,19 +73,15 @@ jobs:
       - name: Run GoSec on changed directories
         if: steps.changed.outputs.skip == 'false'
         run: |
+          PACKAGES=""
           for dir in ${{ steps.changed.outputs.dirs }}; do
-            gosec -fmt sarif -out "gosec-${dir//\//-}.sarif" "./${dir}/..." || true
+            PACKAGES="$PACKAGES ./${dir}/..."
           done
-          cat gosec-*.sarif | jq -s '
-            {
-              "$schema": .[0]["$schema"],
-              version: .[0].version,
-              runs: [.[].runs[]]
-            }' > gosec-results.sarif
+          gosec -fmt sarif -out gosec-results.sarif $PACKAGES || true
 
       - name: Upload results
         if: steps.changed.outputs.skip == 'false'
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: gosec-results.sarif
           category: gosec
