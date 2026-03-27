@@ -66,35 +66,40 @@ jobs:
           if [ -z "$FILES" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            DIRS=$(echo "$FILES" | xargs -I{} dirname {} | sort -u | paste -sd ' ')
-            echo "dirs=$DIRS" >> "$GITHUB_OUTPUT"
+            # Find Go module roots for changed files
+            MODROOTS=""
+            for f in $FILES; do
+              dir=$(dirname "$f")
+              while [ "$dir" != "." ]; do
+                if [ -f "$dir/go.mod" ]; then
+                  MODROOTS="$MODROOTS $dir"
+                  break
+                fi
+                dir=$(dirname "$dir")
+              done
+            done
+            MODROOTS=$(echo "$MODROOTS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+            echo "modroots=$MODROOTS" >> "$GITHUB_OUTPUT"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run GoSec on changed directories
+      - name: Run GoSec on changed Go modules
         if: steps.changed.outputs.skip == 'false'
         run: |
           EXIT_CODE=0
-          for dir in ${{ steps.changed.outputs.dirs }}; do
-            echo "::group::Scanning ${dir}"
-            gosec -fmt json -out "gosec-${dir//\//-}.json" "./${dir}/..." || EXIT_CODE=1
+          for modroot in ${{ steps.changed.outputs.modroots }}; do
+            echo "::group::Scanning ${modroot}"
+            cd "$modroot"
+            go mod tidy
+            gosec -fmt json -out "$GITHUB_WORKSPACE/gosec-${modroot//\//-}.json" ./... || EXIT_CODE=1
+            cd "$GITHUB_WORKSPACE"
             echo "::endgroup::"
           done
-          # Debug: show raw JSON output
+          # Show findings as GitHub annotations
           for f in gosec-*.json; do
             [ -f "$f" ] || continue
-            echo "=== $f ==="
-            cat "$f"
-            echo ""
-            echo "=== Issues count ==="
-            jq '.Issues | length' "$f"
+            echo "=== Issues found: $(jq '.Issues | length' "$f") ==="
             jq -r '.Issues[]? | "::warning file=\(.file),line=\(.line)::GoSec [\(.rule_id)] \(.details)"' "$f"
-          done
-          # Show golang errors if any
-          for f in gosec-*.json; do
-            [ -f "$f" ] || continue
-            echo "=== Go Errors ==="
-            jq '.GolangErrors' "$f"
           done
           exit $EXIT_CODE
 
