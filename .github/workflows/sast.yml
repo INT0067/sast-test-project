@@ -51,11 +51,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: 'stable'
+          cache: false
 
       - name: Install GoSec
         run: go install github.com/securego/gosec/v2/cmd/gosec@latest
 
-      - name: Get changed Go files
+      - name: Get changed Go directories
         id: changed
         run: |
           FILES=$(git diff --name-only --diff-filter=ACM \
@@ -73,18 +74,18 @@ jobs:
       - name: Run GoSec on changed directories
         if: steps.changed.outputs.skip == 'false'
         run: |
-          PACKAGES=""
+          EXIT_CODE=0
           for dir in ${{ steps.changed.outputs.dirs }}; do
-            PACKAGES="$PACKAGES ./${dir}/..."
+            echo "::group::Scanning ${dir}"
+            gosec -fmt json -out "gosec-${dir//\//-}.json" "./${dir}/..." || EXIT_CODE=1
+            echo "::endgroup::"
           done
-          gosec -fmt sarif -out gosec-results.sarif $PACKAGES || true
-
-      - name: Upload results
-        if: steps.changed.outputs.skip == 'false'
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: gosec-results.sarif
-          category: gosec
+          # Convert JSON results to GitHub annotations
+          for f in gosec-*.json; do
+            [ -f "$f" ] || continue
+            jq -r '.Issues[]? | "::warning file=\(.file),line=\(.line)::GoSec [\(.rule_id)] \(.details)"' "$f"
+          done
+          exit $EXIT_CODE
 
   psalm:
     name: Psalm Taint Analysis (PHP specialist)
