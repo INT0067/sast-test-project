@@ -51,11 +51,12 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: 'stable'
+          cache: false
 
       - name: Install GoSec
         run: go install github.com/securego/gosec/v2/cmd/gosec@latest
 
-      - name: Get changed Go files
+      - name: Get changed Go directories
         id: changed
         run: |
           FILES=$(git diff --name-only --diff-filter=ACM \
@@ -65,26 +66,67 @@ jobs:
           if [ -z "$FILES" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            DIRS=$(echo "$FILES" | xargs -I{} dirname {} | sort -u | paste -sd ' ')
-            echo "dirs=$DIRS" >> "$GITHUB_OUTPUT"
+            # Find Go module roots for changed files
+            MODROOTS=""
+            for f in $FILES; do
+              dir=$(dirname "$f")
+              while [ "$dir" != "." ]; do
+                if [ -f "$dir/go.mod" ]; then
+                  MODROOTS="$MODROOTS $dir"
+                  break
+                fi
+                dir=$(dirname "$dir")
+              done
+            done
+            MODROOTS=$(echo "$MODROOTS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+            echo "modroots=$MODROOTS" >> "$GITHUB_OUTPUT"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run GoSec on changed directories
+      - name: Run GoSec on changed Go modules
         if: steps.changed.outputs.skip == 'false'
         run: |
-          PACKAGES=""
-          for dir in ${{ steps.changed.outputs.dirs }}; do
-            PACKAGES="$PACKAGES ./${dir}/..."
+          EXIT_CODE=0
+          for modroot in ${{ steps.changed.outputs.modroots }}; do
+            echo "::group::Scanning ${modroot}"
+            cd "$modroot"
+            go mod tidy
+            gosec -fmt json -out "$GITHUB_WORKSPACE/gosec-${modroot//\//-}.json" ./... || EXIT_CODE=1
+            cd "$GITHUB_WORKSPACE"
+            echo "::endgroup::"
           done
-          gosec -fmt sarif -out gosec-results.sarif $PACKAGES || true
+          # Build PR comment
+          COMMENT="## GoSec Scan Results\n\n"
+          TOTAL=0
+          for f in gosec-*.json; do
+            [ -f "$f" ] || continue
+            COUNT=$(jq '.Issues | length' "$f")
+            TOTAL=$((TOTAL + COUNT))
+            if [ "$COUNT" -gt 0 ]; then
+              ISSUES=$(jq -r '.Issues[]? | "| `\(.file)` | \(.line) | \(.rule_id) | \(.severity) | \(.details) |"' "$f")
+              COMMENT="${COMMENT}${ISSUES}\n"
+            fi
+          done
+          if [ "$TOTAL" -gt 0 ]; then
+            HEADER="| File | Line | Rule | Severity | Details |\n|---|---|---|---|---|\n"
+            COMMENT="## GoSec Scan Results\n\n**$TOTAL issue(s) found**\n\n${HEADER}${ISSUES}\n"
+          else
+            COMMENT="## GoSec Scan Results\n\nNo issues found."
+          fi
+          echo -e "$COMMENT" > gosec-comment.md
+          # Also show as annotations
+          for f in gosec-*.json; do
+            [ -f "$f" ] || continue
+            jq -r '.Issues[]? | "::warning file=\(.file),line=\(.line)::GoSec [\(.rule_id)] \(.details)"' "$f"
+          done
+          exit $EXIT_CODE
 
-      - name: Upload results
-        if: steps.changed.outputs.skip == 'false'
-        uses: github/codeql-action/upload-sarif@v4
+      - name: Comment GoSec results on PR
+        if: always() && steps.changed.outputs.skip == 'false'
+        uses: marocchino/sticky-pull-request-comment@v2
         with:
-          sarif_file: gosec-results.sarif
-          category: gosec
+          header: gosec-results
+          path: gosec-comment.md
 
   psalm:
     name: Psalm Taint Analysis (PHP specialist)
@@ -126,8 +168,34 @@ jobs:
         run: |
           vendor/bin/psalm \
             --taint-analysis \
-            --output-format=github \
+            --output-format=json \
+            --report=psalm-results.json \
             $(cat ../changed_php_files.txt | sed 's|php-app/||g' | tr '\n' ' ') || true
+          # Build PR comment file
+          echo "## Psalm Taint Analysis Results" > ../psalm-comment.md
+          echo "" >> ../psalm-comment.md
+          if [ -f psalm-results.json ] && jq -e '.' psalm-results.json > /dev/null 2>&1; then
+            COUNT=$(jq 'length' psalm-results.json)
+            if [ "$COUNT" -gt 0 ]; then
+              echo "**${COUNT} issue(s) found**" >> ../psalm-comment.md
+              echo "" >> ../psalm-comment.md
+              echo "| File | Line | Type | Message |" >> ../psalm-comment.md
+              echo "|---|---|---|---|" >> ../psalm-comment.md
+              jq -r '.[]? | "| `\(.file_name)` | \(.line_from) | \(.type) | \(.message) |"' psalm-results.json >> ../psalm-comment.md
+              exit 1
+            else
+              echo "No issues found." >> ../psalm-comment.md
+            fi
+          else
+            echo "No issues found." >> ../psalm-comment.md
+          fi
+
+      - name: Comment Psalm results on PR
+        if: always() && steps.changed.outputs.skip == 'false'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: psalm-results
+          path: psalm-comment.md
 
   trivy:
     name: Trivy (Dependency CVEs)
