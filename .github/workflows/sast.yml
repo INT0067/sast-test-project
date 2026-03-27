@@ -169,22 +169,25 @@ jobs:
           vendor/bin/psalm \
             --taint-analysis \
             --output-format=json \
-            $(cat ../changed_php_files.txt | sed 's|php-app/||g' | tr '\n' ' ') > psalm-results.json 2>&1 || true
-          # Build PR comment
-          if [ -f psalm-results.json ] && jq -e '.issues' psalm-results.json > /dev/null 2>&1; then
-            COUNT=$(jq '.issues | length' psalm-results.json)
+            --report=psalm-results.json \
+            $(cat ../changed_php_files.txt | sed 's|php-app/||g' | tr '\n' ' ') || true
+          # Build PR comment file
+          echo "## Psalm Taint Analysis Results" > ../psalm-comment.md
+          echo "" >> ../psalm-comment.md
+          if [ -f psalm-results.json ] && jq -e '.' psalm-results.json > /dev/null 2>&1; then
+            COUNT=$(jq 'length' psalm-results.json)
             if [ "$COUNT" -gt 0 ]; then
-              HEADER="## Psalm Taint Analysis Results\n\n**$COUNT issue(s) found**\n\n| File | Line | Type | Message |\n|---|---|---|---|\n"
-              ROWS=$(jq -r '.issues[]? | "| `\(.file_name)` | \(.line_from) | \(.type) | \(.message) |"' psalm-results.json)
-              echo -e "${HEADER}${ROWS}\n" > ../psalm-comment.md
-              # Also print for log
-              jq -r '.issues[]? | "::error file=\(.file_name),line=\(.line_from)::\(.type): \(.message)"' psalm-results.json
+              echo "**${COUNT} issue(s) found**" >> ../psalm-comment.md
+              echo "" >> ../psalm-comment.md
+              echo "| File | Line | Type | Message |" >> ../psalm-comment.md
+              echo "|---|---|---|---|" >> ../psalm-comment.md
+              jq -r '.[]? | "| `\(.file_name)` | \(.line_from) | \(.type) | \(.message) |"' psalm-results.json >> ../psalm-comment.md
               exit 1
             else
-              echo -e "## Psalm Taint Analysis Results\n\nNo issues found." > ../psalm-comment.md
+              echo "No issues found." >> ../psalm-comment.md
             fi
           else
-            echo -e "## Psalm Taint Analysis Results\n\nNo issues found." > ../psalm-comment.md
+            echo "No issues found." >> ../psalm-comment.md
           fi
 
       - name: Comment Psalm results on PR
