@@ -1,0 +1,160 @@
+name: SAST PR Scan
+
+on:
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  sast-scan:
+    name: SAST Security Scan
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed
+        run: |
+          CHANGED_GO=$(git diff --name-only --diff-filter=ACM \
+            ${{ github.event.pull_request.base.sha }} \
+            ${{ github.event.pull_request.head.sha }} \
+            -- '*.go' || true)
+          CHANGED_PHP=$(git diff --name-only --diff-filter=ACM \
+            ${{ github.event.pull_request.base.sha }} \
+            ${{ github.event.pull_request.head.sha }} \
+            -- '*.php' | grep -v '/vendor/' | grep -v '/node_modules/' || true)
+
+          if [ -n "$CHANGED_GO" ]; then
+            echo "has_go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_go=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$CHANGED_PHP" ]; then
+            echo "has_php=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_php=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Semgrep
+        id: semgrep
+        run: |
+          semgrep scan \
+            --config auto \
+            --config p/owasp-top-ten \
+            --config p/php \
+            --config p/golang \
+            --config p/secrets \
+            --json \
+            --baseline-commit ${{ github.event.pull_request.base.sha }} \
+            2>/dev/null > semgrep-results.json || true
+
+          SEMGREP_COUNT=$(jq '.results | length' semgrep-results.json 2>/dev/null || echo "0")
+          echo "count=$SEMGREP_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Run GoSec
+        id: gosec
+        if: steps.changed.outputs.has_go == 'true'
+        run: |
+          export PATH="$PATH:$HOME/go/bin"
+          CHANGED_GO=$(git diff --name-only --diff-filter=ACM \
+            ${{ github.event.pull_request.base.sha }} \
+            ${{ github.event.pull_request.head.sha }} \
+            -- '*.go')
+
+          MODROOTS=""
+          for f in $CHANGED_GO; do
+            dir=$(dirname "$f")
+            while [ "$dir" != "." ]; do
+              if [ -f "$dir/go.mod" ]; then
+                MODROOTS="$MODROOTS $dir"
+                break
+              fi
+              dir=$(dirname "$dir")
+            done
+            if [ -f "go.mod" ] && [ "$dir" = "." ]; then
+              MODROOTS="$MODROOTS ."
+            fi
+          done
+          MODROOTS=$(echo "$MODROOTS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+
+          for modroot in $MODROOTS; do
+            cd "$modroot"
+            go mod tidy 2>/dev/null
+            gosec -fmt json -out "$GITHUB_WORKSPACE/gosec-results.json" ./... 2>/dev/null || true
+            cd "$GITHUB_WORKSPACE"
+          done
+
+          GOSEC_COUNT=$(jq '.Issues | length' gosec-results.json 2>/dev/null || echo "0")
+          echo "count=$GOSEC_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Build and post PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          RESULT_FILE="sast-comment.md"
+          SEMGREP_COUNT=${{ steps.semgrep.outputs.count || '0' }}
+          GOSEC_COUNT=${{ steps.gosec.outputs.count || '0' }}
+          TOTAL=$((SEMGREP_COUNT + GOSEC_COUNT))
+
+          echo "# SAST Scan Results" > "$RESULT_FILE"
+          echo "" >> "$RESULT_FILE"
+          echo "**Branch:** \`$BRANCH\` | **PR:** #$PR_NUMBER | **Scanned at:** $(date '+%Y-%m-%d %H:%M:%S')" >> "$RESULT_FILE"
+          echo "" >> "$RESULT_FILE"
+
+          # Semgrep results
+          echo "---" >> "$RESULT_FILE"
+          echo "## Semgrep (PHP + Go) — $SEMGREP_COUNT issue(s)" >> "$RESULT_FILE"
+          echo "" >> "$RESULT_FILE"
+          if [ "$SEMGREP_COUNT" -gt 0 ]; then
+            echo "| File | Line | Rule | Severity | Message |" >> "$RESULT_FILE"
+            echo "|---|---|---|---|---|" >> "$RESULT_FILE"
+            jq -r '.results[]? | "| `\(.path)` | \(.start.line) | \(.check_id | split(".") | last) | \(.extra.severity) | \(.extra.message | split("\n") | first | .[0:80]) |"' semgrep-results.json >> "$RESULT_FILE"
+          else
+            echo "No issues found." >> "$RESULT_FILE"
+          fi
+          echo "" >> "$RESULT_FILE"
+
+          # GoSec results
+          echo "---" >> "$RESULT_FILE"
+          if [ -f gosec-results.json ]; then
+            echo "## GoSec (Go specialist) — $GOSEC_COUNT issue(s)" >> "$RESULT_FILE"
+            echo "" >> "$RESULT_FILE"
+            if [ "$GOSEC_COUNT" -gt 0 ]; then
+              echo "| File | Line | Rule | Severity | Details |" >> "$RESULT_FILE"
+              echo "|---|---|---|---|---|" >> "$RESULT_FILE"
+              jq -r '.Issues[]? | "| `\(.file | split("/") | .[-2:] | join("/"))` | \(.line) | \(.rule_id) | \(.severity) | \(.details) |"' gosec-results.json >> "$RESULT_FILE"
+            else
+              echo "No issues found." >> "$RESULT_FILE"
+            fi
+          else
+            echo "## GoSec (Go specialist) — Skipped (no Go files changed)" >> "$RESULT_FILE"
+          fi
+          echo "" >> "$RESULT_FILE"
+
+          echo "---" >> "$RESULT_FILE"
+          echo "**Total issues: $TOTAL** | Scanned using Semgrep + GoSec" >> "$RESULT_FILE"
+
+          # Post or update comment
+          EXISTING=$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+            --jq '.[] | select(.body | startswith("# SAST Scan Results")) | .id' | tail -1)
+
+          if [ -n "$EXISTING" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/$EXISTING" \
+              -X PATCH -f body="$(cat "$RESULT_FILE")" > /dev/null
+          else
+            gh pr comment "$PR_NUMBER" --body "$(cat "$RESULT_FILE")"
+          fi
+
+          # Fail the check if issues found
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "::error::SAST scan found $TOTAL security issue(s)"
+            exit 1
+          fi
