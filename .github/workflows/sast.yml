@@ -147,9 +147,10 @@ jobs:
           if [ "$SEMGREP_COUNT" -gt 0 ]; then
             jq -r '.results[]? | "::error file=\(.path),line=\(.start.line)::Semgrep [\(.check_id | split(".") | last)]: \(.extra.message | split("\n") | first | .[0:200])"' semgrep-results.json
           fi
-          # GoSec annotations
+          # GoSec annotations (strip absolute path to make relative)
           if [ -f gosec-results.json ] && [ "$GOSEC_COUNT" -gt 0 ]; then
-            jq -r '.Issues[]? | "::error file=\(.file),line=\(.line)::GoSec [\(.rule_id)]: \(.details)"' gosec-results.json
+            WORKSPACE="${GITHUB_WORKSPACE}/"
+            jq -r --arg ws "$WORKSPACE" '.Issues[]? | "::error file=\(.file | gsub($ws; "")),line=\(.line)::GoSec [\(.rule_id)]: \(.details)"' gosec-results.json
           fi >> "$RESULT_FILE"
 
           # Post or update comment
