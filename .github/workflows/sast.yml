@@ -140,7 +140,17 @@ jobs:
           echo "" >> "$RESULT_FILE"
 
           echo "---" >> "$RESULT_FILE"
-          echo "**Total issues: $TOTAL** | Scanned using Semgrep + GoSec" >> "$RESULT_FILE"
+          echo "**Total issues: $TOTAL** | Scanned using Semgrep + GoSec"
+
+          # Generate annotations on code lines
+          # Semgrep annotations
+          if [ "$SEMGREP_COUNT" -gt 0 ]; then
+            jq -r '.results[]? | "::error file=\(.path),line=\(.start.line)::Semgrep [\(.check_id | split(".") | last)]: \(.extra.message | split("\n") | first | .[0:200])"' semgrep-results.json
+          fi
+          # GoSec annotations
+          if [ -f gosec-results.json ] && [ "$GOSEC_COUNT" -gt 0 ]; then
+            jq -r '.Issues[]? | "::error file=\(.file),line=\(.line)::GoSec [\(.rule_id)]: \(.details)"' gosec-results.json
+          fi >> "$RESULT_FILE"
 
           # Post or update comment
           EXISTING=$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
