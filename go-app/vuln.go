@@ -1,7 +1,7 @@
 package main
 
 import (
-	"crypto/md5"
+	"crypto/sha256"
 	"crypto/tls"
 	"database/sql"
 	"fmt"
@@ -9,22 +9,21 @@ import (
 	"os/exec"
 )
 
-// Vulnerability 1: SQL Injection
+// Fixed: SQL Injection — using parameterized query
 func getUserHandler(w http.ResponseWriter, r *http.Request) {
 	db, _ := sql.Open("mysql", "user:pass@/dbname")
 	userID := r.URL.Query().Get("id")
-	query := "SELECT * FROM users WHERE id = " + userID
-	rows, _ := db.Query(query)
+	rows, _ := db.Query("SELECT * FROM users WHERE id = ?", userID)
 	defer rows.Close()
 	fmt.Fprintf(w, "done")
 }
 
-// Vulnerability 2: Command Injection
+// Fixed: Command Injection — passing args directly, no shell
 func pingHandler(w http.ResponseWriter, r *http.Request) {
 	host := r.URL.Query().Get("host")
-	cmd := exec.Command("sh", "-c", "ping -c 1 "+host)
+	cmd := exec.Command("ping", "-c", "1", host)
 	output, _ := cmd.CombinedOutput()
-	fmt.Fprintf(w, string(output))
+	w.Write(output)
 }
 
 // Vulnerability 3: Hardcoded credentials
@@ -41,8 +40,8 @@ func insecureHTTPClient() *http.Client {
 	return &http.Client{Transport: tr}
 }
 
-// Vulnerability 5: Weak crypto (MD5)
+// Fixed: Weak crypto — using SHA256 instead of MD5
 func hashPassword(password string) string {
-	h := md5.Sum([]byte(password))
+	h := sha256.Sum256([]byte(password))
 	return fmt.Sprintf("%x", h)
 }
