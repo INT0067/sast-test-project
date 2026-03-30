@@ -25,7 +25,7 @@ echo "Running SAST scans..."
 # Get changed files compared to main
 BASE_BRANCH="main"
 CHANGED_GO=$(git diff --name-only --diff-filter=ACM "$BASE_BRANCH"..."$BRANCH" -- '*.go' || true)
-CHANGED_PHP=$(git diff --name-only --diff-filter=ACM "$BASE_BRANCH"..."$BRANCH" -- '*.php' || true)
+CHANGED_PHP=$(git diff --name-only --diff-filter=ACM "$BASE_BRANCH"..."$BRANCH" -- '*.php' | grep -v '/vendor/' | grep -v '/node_modules/' || true)
 CHANGED_DEPS=$(git diff --name-only "$BASE_BRANCH"..."$BRANCH" -- '**/go.sum' '**/go.mod' '**/composer.lock' '**/composer.json' || true)
 
 # Initialize result file
@@ -250,7 +250,16 @@ echo "Total issues found: $TOTAL_ISSUES"
 echo ""
 echo "Posting results to PR #$PR_NUMBER..."
 
-gh pr comment "$PR_NUMBER" --body "$(cat "$RESULT_FILE")"
+# Check if a previous SAST comment exists, edit it instead of creating new one
+EXISTING_COMMENT=$(gh api "repos/{owner}/{repo}/issues/$PR_NUMBER/comments" --jq '.[] | select(.body | startswith("# SAST Scan Results")) | .id' | tail -1)
+
+if [ -n "$EXISTING_COMMENT" ]; then
+    gh api "repos/{owner}/{repo}/issues/comments/$EXISTING_COMMENT" -X PATCH -f body="$(cat "$RESULT_FILE")" > /dev/null
+    echo "Updated existing comment on PR #$PR_NUMBER"
+else
+    gh pr comment "$PR_NUMBER" --body "$(cat "$RESULT_FILE")"
+    echo "Posted new comment on PR #$PR_NUMBER"
+fi
 
 echo "Results posted to PR #$PR_NUMBER"
 echo "View at: $(gh pr view "$PR_NUMBER" --json url --jq '.url')"
