@@ -142,17 +142,6 @@ jobs:
           echo "---" >> "$RESULT_FILE"
           echo "**Total issues: $TOTAL** | Scanned using Semgrep + GoSec"
 
-          # Generate annotations on code lines
-          # Semgrep annotations
-          if [ "$SEMGREP_COUNT" -gt 0 ]; then
-            jq -r '.results[]? | "::error file=\(.path),line=\(.start.line)::Semgrep [\(.check_id | split(".") | last)]: \(.extra.message | split("\n") | first | .[0:200])"' semgrep-results.json
-          fi
-          # GoSec annotations (strip absolute path to make relative)
-          if [ -f gosec-results.json ] && [ "$GOSEC_COUNT" -gt 0 ]; then
-            WORKSPACE="${GITHUB_WORKSPACE}/"
-            jq -r --arg ws "$WORKSPACE" '.Issues[]? | "::error file=\(.file | gsub($ws; "")),line=\(.line)::GoSec [\(.rule_id)]: \(.details)"' gosec-results.json
-          fi >> "$RESULT_FILE"
-
           # Post or update comment
           EXISTING=$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
             --jq '.[] | select(.body | startswith("# SAST Scan Results")) | .id' | tail -1)
@@ -164,8 +153,16 @@ jobs:
             gh pr comment "$PR_NUMBER" --body "$(cat "$RESULT_FILE")"
           fi
 
+          # Generate annotations on code lines (after comment, so they don't appear in comment)
+          if [ "$SEMGREP_COUNT" -gt 0 ]; then
+            jq -r '.results[]? | "::error file=\(.path),line=\(.start.line)::Semgrep [\(.check_id | split(".") | last)]: \(.extra.message | split("\n") | first | .[0:200])"' semgrep-results.json
+          fi
+          if [ -f gosec-results.json ] && [ "$GOSEC_COUNT" -gt 0 ]; then
+            WORKSPACE="${GITHUB_WORKSPACE}/"
+            jq -r --arg ws "$WORKSPACE" '.Issues[]? | "::error file=\(.file | gsub($ws; "")),line=\(.line)::GoSec [\(.rule_id)]: \(.details)"' gosec-results.json
+          fi
+
           # Fail the check if issues found
           if [ "$TOTAL" -gt 0 ]; then
-            echo "::error::SAST scan found $TOTAL security issue(s)"
             exit 1
           fi
