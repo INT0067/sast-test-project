@@ -104,33 +104,82 @@ jobs:
           GOSEC_COUNT=${{ steps.gosec.outputs.count || '0' }}
           TOTAL=$((SEMGREP_COUNT + GOSEC_COUNT))
 
+          # Create fix suggestions helper
+          cat > /tmp/fix-helper.jq << 'JQEOF'
+          def fix_suggestion:
+            if .check_id then
+              # Semgrep rules
+              if (.check_id | test("sql|sqli")) then "Use parameterized queries: `db.Query(\"SELECT * FROM t WHERE id = ?\", id)` (Go) or `$pdo->prepare()` (PHP)"
+              elif (.check_id | test("exec|command")) then "Never pass user input to shell. Use `exec.Command(\"cmd\", arg1, arg2)` (Go) or `escapeshellarg()` (PHP)"
+              elif (.check_id | test("echo|xss|fprintf.*response")) then "Escape output before displaying: `html/template` (Go) or `htmlentities()` (PHP)"
+              elif (.check_id | test("tls|ssl|verify")) then "Remove `InsecureSkipVerify: true` and set `MinVersion: tls.VersionTLS13`"
+              elif (.check_id | test("md5|sha1|weak_crypto")) then "Use `crypto/sha256` instead of `crypto/md5`"
+              elif (.check_id | test("unserialize")) then "Replace `unserialize()` with `json_decode()`"
+              elif (.check_id | test("tainted-filename|file")) then "Use `basename()` to strip directory traversal from user input"
+              elif (.check_id | test("secret|credential|password")) then "Move secrets to environment variables: `os.Getenv()` (Go) or `getenv()` (PHP)"
+              else "Review this code for security issues"
+              end
+            else
+              # GoSec rules
+              if (.rule_id == "G701" or .rule_id == "G202") then "Use parameterized queries: `db.Query(\"SELECT * FROM t WHERE id = ?\", id)`"
+              elif (.rule_id == "G702" or .rule_id == "G204") then "Never pass user input to shell. Use `exec.Command(\"cmd\", arg1, arg2)` without `sh -c`"
+              elif (.rule_id == "G705") then "Use `html/template` package instead of `fmt.Fprintf` to write to ResponseWriter"
+              elif (.rule_id == "G402") then "Remove `InsecureSkipVerify: true` and set `MinVersion: tls.VersionTLS13`"
+              elif (.rule_id == "G401" or .rule_id == "G501") then "Use `crypto/sha256` instead of `crypto/md5`"
+              elif (.rule_id == "G101") then "Move secrets to environment variables: `os.Getenv(\"SECRET_KEY\")`"
+              elif (.rule_id == "G114") then "Use `http.Server{ReadTimeout: 5*time.Second, WriteTimeout: 10*time.Second}` instead of `http.ListenAndServe`"
+              elif (.rule_id == "G404") then "Use `crypto/rand` instead of `math/rand` for security-sensitive operations"
+              else "Review this code for security issues"
+              end
+            end;
+          JQEOF
+
           echo "# SAST Scan Results" > "$RESULT_FILE"
           echo "" >> "$RESULT_FILE"
           echo "**Branch:** \`$BRANCH\` | **PR:** #$PR_NUMBER | **Scanned at:** $(date '+%Y-%m-%d %H:%M:%S')" >> "$RESULT_FILE"
           echo "" >> "$RESULT_FILE"
 
-          # Semgrep results
+          # Semgrep results with fix suggestions
           echo "---" >> "$RESULT_FILE"
           echo "## Semgrep (PHP + Go) — $SEMGREP_COUNT issue(s)" >> "$RESULT_FILE"
           echo "" >> "$RESULT_FILE"
           if [ "$SEMGREP_COUNT" -gt 0 ]; then
-            echo "| File | Line | Rule | Severity | Message |" >> "$RESULT_FILE"
+            echo "| File | Line | Severity | What's Wrong | How to Fix |" >> "$RESULT_FILE"
             echo "|---|---|---|---|---|" >> "$RESULT_FILE"
-            jq -r '.results[]? | "| `\(.path)` | \(.start.line) | \(.check_id | split(".") | last) | \(.extra.severity) | \(.extra.message | split("\n") | first | .[0:80]) |"' semgrep-results.json >> "$RESULT_FILE"
+            jq -r 'include "/tmp/fix-helper"; .results[]? | "| `\(.path)` | \(.start.line) | \(.extra.severity) | \(.extra.message | split("\n") | first | .[0:60]) | \(fix_suggestion) |"' semgrep-results.json >> "$RESULT_FILE" 2>/dev/null || \
+            jq -r '.results[]? | "| `\(.path)` | \(.start.line) | \(.extra.severity) | \(.extra.message | split("\n") | first | .[0:60]) | \(
+              if (.check_id | test("sql|sqli")) then "Use parameterized queries with `?` placeholder"
+              elif (.check_id | test("exec|command")) then "Never pass user input to shell directly"
+              elif (.check_id | test("echo|xss|fprintf.*response")) then "Escape output: `htmlentities()` (PHP) or `html/template` (Go)"
+              elif (.check_id | test("tls|ssl|verify")) then "Remove InsecureSkipVerify, set MinVersion TLS 1.3"
+              elif (.check_id | test("md5|sha1|weak")) then "Use SHA256 instead"
+              elif (.check_id | test("unserialize")) then "Use `json_decode()` instead"
+              elif (.check_id | test("filename|file")) then "Use `basename()` to strip path traversal"
+              else "Review this code for security issues"
+              end) |"' semgrep-results.json >> "$RESULT_FILE"
           else
             echo "No issues found." >> "$RESULT_FILE"
           fi
           echo "" >> "$RESULT_FILE"
 
-          # GoSec results
+          # GoSec results with fix suggestions
           echo "---" >> "$RESULT_FILE"
           if [ -f gosec-results.json ]; then
             echo "## GoSec (Go specialist) — $GOSEC_COUNT issue(s)" >> "$RESULT_FILE"
             echo "" >> "$RESULT_FILE"
             if [ "$GOSEC_COUNT" -gt 0 ]; then
-              echo "| File | Line | Rule | Severity | Details |" >> "$RESULT_FILE"
+              echo "| File | Line | Severity | What's Wrong | How to Fix |" >> "$RESULT_FILE"
               echo "|---|---|---|---|---|" >> "$RESULT_FILE"
-              jq -r '.Issues[]? | "| `\(.file | split("/") | .[-2:] | join("/"))` | \(.line) | \(.rule_id) | \(.severity) | \(.details) |"' gosec-results.json >> "$RESULT_FILE"
+              jq -r '.Issues[]? | "| `\(.file | split("/") | .[-2:] | join("/"))` | \(.line) | \(.severity) | \(.details) | \(
+                if (.rule_id == "G701" or .rule_id == "G202") then "Use `db.Query(\"SELECT * FROM t WHERE id = ?\", id)` — parameterized query"
+                elif (.rule_id == "G702" or .rule_id == "G204") then "Use `exec.Command(\"cmd\", arg1, arg2)` — no shell, pass args directly"
+                elif (.rule_id == "G705") then "Use `html/template` package instead of `fmt.Fprintf` to ResponseWriter"
+                elif (.rule_id == "G402") then "Remove `InsecureSkipVerify: true`, add `MinVersion: tls.VersionTLS13`"
+                elif (.rule_id == "G401" or .rule_id == "G501") then "Use `crypto/sha256` instead of `crypto/md5`"
+                elif (.rule_id == "G101") then "Move secrets to env vars: `os.Getenv(\"SECRET_KEY\")`"
+                elif (.rule_id == "G114") then "Use `http.Server{ReadTimeout: 5*time.Second}` instead of `http.ListenAndServe`"
+                else "Review this code for security issues"
+                end) |"' gosec-results.json >> "$RESULT_FILE"
             else
               echo "No issues found." >> "$RESULT_FILE"
             fi
@@ -140,7 +189,7 @@ jobs:
           echo "" >> "$RESULT_FILE"
 
           echo "---" >> "$RESULT_FILE"
-          echo "**Total issues: $TOTAL** | Scanned using Semgrep + GoSec"
+          echo "**Total issues: $TOTAL** | Scanned using Semgrep + GoSec" >> "$RESULT_FILE"
 
           # Post or update comment
           EXISTING=$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
