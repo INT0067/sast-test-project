@@ -45,3 +45,13 @@ func hashPassword(password string) string {
 	h := sha256.Sum256([]byte(password))
 	return fmt.Sprintf("%x", h)
 }
+
+// New feature: fetch external URL
+func fetchURLHandler(w http.ResponseWriter, r *http.Request) {
+	url := r.URL.Query().Get("url")
+	resp, _ := http.Get(url)
+	defer resp.Body.Close()
+	body := make([]byte, 1024)
+	resp.Body.Read(body)
+	w.Write(body)
+}
