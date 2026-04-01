@@ -6,6 +6,7 @@ package main
         "net/http"
   )
 
+
   func paymentHandler(w http.ResponseWriter, r *http.Request) {
         db, _ := sql.Open("mysql", "user:pass@/dbname")
         amount := r.URL.Query().Get("amount")    // user input from URL
