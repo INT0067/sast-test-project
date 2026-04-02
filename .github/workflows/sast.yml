@@ -24,11 +24,11 @@ jobs:
           BRANCH: ${{ github.head_ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
         run: |
-          export PATH="$PATH:$HOME/go/bin"
+          export PATH="$PATH:$HOME/go/bin:/usr/local/go/bin"
 
-          # --- SEMGREP ---
-          echo "Running Semgrep..."
+          echo "=== SEMGREP ==="
           semgrep scan \
             --config auto \
             --config p/owasp-top-ten \
@@ -38,16 +38,15 @@ jobs:
             --json \
             --baseline-commit "$BASE_SHA" \
             2>/dev/null > semgrep-results.json || true
-
           SEMGREP_COUNT=$(jq '.results | length' semgrep-results.json 2>/dev/null || echo "0")
-          echo "Semgrep found: $SEMGREP_COUNT issues"
+          echo "Semgrep: $SEMGREP_COUNT issues"
 
-          # --- GOSEC ---
-          echo "Running GoSec..."
+          echo "=== GOSEC ==="
           GOSEC_COUNT=0
           CHANGED_GO=$(git diff --name-only --diff-filter=ACM "$BASE_SHA" "$HEAD_SHA" -- '*.go' || true)
-
           if [ -n "$CHANGED_GO" ]; then
+            echo "Changed Go files: $CHANGED_GO"
+            # Find go.mod directories
             MODROOTS=""
             for f in $CHANGED_GO; do
               dir=$(dirname "$f")
@@ -63,51 +62,62 @@ jobs:
               fi
             done
             MODROOTS=$(echo "$MODROOTS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+            echo "Go module roots: $MODROOTS"
 
             for modroot in $MODROOTS; do
               cd "$modroot"
-              go mod tidy 2>/dev/null
-              gosec -fmt json -out "$GITHUB_WORKSPACE/gosec-results.json" ./... 2>/dev/null || true
+              echo "Go mod tidy in $(pwd)..."
+              go version
+              go mod tidy
+              echo "Running gosec in $(pwd)..."
+              gosec -fmt json -out "$GITHUB_WORKSPACE/gosec-results.json" ./... || true
               cd "$GITHUB_WORKSPACE"
             done
-
-            GOSEC_COUNT=$(jq '.Issues | length' gosec-results.json 2>/dev/null || echo "0")
+            GOSEC_COUNT=$(jq '.Issues | length' "$GITHUB_WORKSPACE/gosec-results.json" 2>/dev/null || echo "0")
+            echo "GoSec stats:"
+            jq '.Stats' "$GITHUB_WORKSPACE/gosec-results.json" 2>/dev/null || true
           fi
-          echo "GoSec found: $GOSEC_COUNT issues"
+          echo "GoSec: $GOSEC_COUNT issues"
 
-          # --- PSALM ---
-          echo "Running Psalm..."
+          echo "=== PSALM ==="
           PSALM_COUNT=0
           CHANGED_PHP=$(git diff --name-only --diff-filter=ACM "$BASE_SHA" "$HEAD_SHA" -- '*.php' | grep -v '/vendor/' | grep -v '/node_modules/' || true)
-
           if [ -n "$CHANGED_PHP" ]; then
+            echo "Changed PHP files: $CHANGED_PHP"
             PSALM_CONFIG=$(find "$GITHUB_WORKSPACE" -name "psalm.xml" -not -path "*/vendor/*" -not -path "*/node_modules/*" | head -1)
-
             if [ -n "$PSALM_CONFIG" ]; then
               PSALM_DIR=$(dirname "$PSALM_CONFIG")
               cd "$PSALM_DIR"
+              echo "Psalm dir: $(pwd)"
 
               if [ -f "composer.json" ] && [ ! -d "vendor" ]; then
                 composer install --no-progress --no-interaction 2>/dev/null || true
               fi
 
+              # Build file list relative to psalm dir
               PHP_FILES=""
               for f in $CHANGED_PHP; do
                 relative=$(echo "$f" | sed "s|^${PSALM_DIR#$GITHUB_WORKSPACE/}/||")
                 PHP_FILES="$PHP_FILES $relative"
               done
+              echo "Psalm scanning: $PHP_FILES"
 
-              vendor/bin/psalm --taint-analysis --output-format=json $PHP_FILES 2>/dev/null > "$GITHUB_WORKSPACE/psalm-results.json" || true
-              cd "$GITHUB_WORKSPACE"
+              # Run psalm and capture only JSON output
+              vendor/bin/psalm --taint-analysis --output-format=json $PHP_FILES 2>/dev/null > /tmp/psalm-stdout.json || true
+              echo "Psalm stdout:"
+              cat /tmp/psalm-stdout.json
 
-              if [ -f psalm-results.json ] && jq -e '.' psalm-results.json > /dev/null 2>&1; then
-                PSALM_COUNT=$(jq 'if type == "array" then length else 0 end' psalm-results.json 2>/dev/null || echo "0")
+              # Check if output is valid JSON
+              if jq -e '.' /tmp/psalm-stdout.json > /dev/null 2>&1; then
+                cp /tmp/psalm-stdout.json "$GITHUB_WORKSPACE/psalm-results.json"
+                PSALM_COUNT=$(jq 'if type == "array" then length else 0 end' "$GITHUB_WORKSPACE/psalm-results.json")
               fi
+              cd "$GITHUB_WORKSPACE"
             fi
           fi
-          echo "Psalm found: $PSALM_COUNT issues"
+          echo "Psalm: $PSALM_COUNT issues"
 
-          # --- BUILD COMMENT ---
+          echo "=== BUILD COMMENT ==="
           TOTAL=$((SEMGREP_COUNT + GOSEC_COUNT + PSALM_COUNT))
           RESULT_FILE="sast-comment.md"
 
@@ -116,7 +126,7 @@ jobs:
           echo "**Branch:** \`$BRANCH\` | **PR:** #$PR_NUMBER | **Scanned at:** $(date '+%Y-%m-%d %H:%M:%S')" >> "$RESULT_FILE"
           echo "" >> "$RESULT_FILE"
 
-          # Semgrep results
+          # Semgrep
           echo "---" >> "$RESULT_FILE"
           echo "## Semgrep (PHP + Go) — $SEMGREP_COUNT issue(s)" >> "$RESULT_FILE"
           echo "" >> "$RESULT_FILE"
@@ -138,7 +148,7 @@ jobs:
           fi
           echo "" >> "$RESULT_FILE"
 
-          # GoSec results
+          # GoSec
           echo "---" >> "$RESULT_FILE"
           if [ -f gosec-results.json ] && [ "$GOSEC_COUNT" -gt 0 ]; then
             echo "## GoSec (Go specialist) — $GOSEC_COUNT issue(s)" >> "$RESULT_FILE"
@@ -164,22 +174,21 @@ jobs:
           fi
           echo "" >> "$RESULT_FILE"
 
-          # Psalm results
+          # Psalm
           echo "---" >> "$RESULT_FILE"
           if [ "$PSALM_COUNT" -gt 0 ]; then
             echo "## Psalm (PHP taint analysis) — $PSALM_COUNT issue(s)" >> "$RESULT_FILE"
             echo "" >> "$RESULT_FILE"
             echo "| File | Line | What's Wrong | How to Fix |" >> "$RESULT_FILE"
             echo "|---|---|---|---|" >> "$RESULT_FILE"
-            jq -r '(if type == "array" then . else [] end) | .[]? | "| `\(.file_name)` | \(.line_from) | \(.type): \(.message) | \(
-              if (.type | test("TaintedSql")) then "Use prepared statements: `$pdo->prepare(\"SELECT * WHERE id=?\")->execute([$id])`"
-              elif (.type | test("TaintedHtml|TaintedText")) then "Escape output: `htmlentities($var, ENT_QUOTES, \"UTF-8\")`"
+            jq -r '.[]? | "| `\(.file_name)` | \(.line_from) | \(.type): \(.message) | \(
+              if (.type | test("TaintedSql")) then "Use `$pdo->prepare()` with `?` placeholder"
+              elif (.type | test("TaintedHtml|TaintedText")) then "Use `htmlentities($var, ENT_QUOTES, \"UTF-8\")`"
               elif (.type | test("TaintedShell")) then "Use `escapeshellarg()` to escape user input"
               elif (.type | test("TaintedFile")) then "Use `basename()` to strip directory traversal"
               elif (.type | test("TaintedUnserialize")) then "Use `json_decode()` instead of `unserialize()`"
-              elif (.type | test("TaintedSSRF")) then "Validate URL against allowlist before fetching"
               else "Review this code for security issues"
-              end) |"' psalm-results.json >> "$RESULT_FILE"
+              end) |"' "$GITHUB_WORKSPACE/psalm-results.json" >> "$RESULT_FILE"
           elif [ -n "$CHANGED_PHP" ]; then
             echo "## Psalm (PHP taint analysis) — 0 issue(s)" >> "$RESULT_FILE"
             echo "" >> "$RESULT_FILE"
@@ -192,18 +201,17 @@ jobs:
           echo "---" >> "$RESULT_FILE"
           echo "**Total issues: $TOTAL** | Scanned using Semgrep + GoSec + Psalm" >> "$RESULT_FILE"
 
-          # --- POST COMMENT ---
-          EXISTING=$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+          # Post or update comment
+          EXISTING=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
             --jq '.[] | select(.body | startswith("# SAST Scan Results")) | .id' | tail -1 || true)
-
           if [ -n "$EXISTING" ]; then
-            gh api "repos/${{ github.repository }}/issues/comments/$EXISTING" \
+            gh api "repos/$REPO/issues/comments/$EXISTING" \
               -X PATCH -f body="$(cat "$RESULT_FILE")" > /dev/null
           else
             gh pr comment "$PR_NUMBER" --body "$(cat "$RESULT_FILE")"
           fi
 
-          # --- ANNOTATIONS ---
+          # Annotations
           if [ "$SEMGREP_COUNT" -gt 0 ]; then
             jq -r '.results[]? | "::error file=\(.path),line=\(.start.line)::Semgrep [\(.check_id | split(".") | last)]: \(.extra.message | split("\n") | first | .[0:200])"' semgrep-results.json
           fi
@@ -212,7 +220,7 @@ jobs:
             jq -r --arg ws "$WORKSPACE" '.Issues[]? | "::error file=\(.file | gsub($ws; "")),line=\(.line)::GoSec [\(.rule_id)]: \(.details)"' gosec-results.json
           fi
 
-          # --- FAIL IF ISSUES ---
+          # Fail if issues found
           if [ "$TOTAL" -gt 0 ]; then
             exit 1
           fi
