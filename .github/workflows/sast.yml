@@ -25,7 +25,12 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          export PATH="$PATH:$HOME/go/bin"
+          export PATH="$PATH:$HOME/go/bin:/usr/local/go/bin"
+          echo "PATH: $PATH"
+          echo "HOME: $HOME"
+          echo "WORKSPACE: $GITHUB_WORKSPACE"
+          which gosec || echo "gosec not found in PATH"
+          which semgrep || echo "semgrep not found in PATH"
 
           # --- SEMGREP ---
           echo "Running Semgrep..."
@@ -67,7 +72,10 @@ jobs:
             for modroot in $MODROOTS; do
               cd "$modroot"
               go mod tidy 2>/dev/null
-              gosec -fmt json -out "$GITHUB_WORKSPACE/gosec-results.json" ./... 2>/dev/null || true
+              echo "Running gosec in $(pwd)"
+            gosec -fmt json -out "$GITHUB_WORKSPACE/gosec-results.json" ./... || true
+            echo "GoSec exit code: $?"
+            cat "$GITHUB_WORKSPACE/gosec-results.json" | jq '.Stats' 2>/dev/null
               cd "$GITHUB_WORKSPACE"
             done
 
@@ -97,7 +105,10 @@ jobs:
                 PHP_FILES="$PHP_FILES $relative"
               done
 
-              vendor/bin/psalm --taint-analysis --output-format=json $PHP_FILES 2>/dev/null > "$GITHUB_WORKSPACE/psalm-results.json" || true
+              echo "Running Psalm in $(pwd) on files: $PHP_FILES"
+              vendor/bin/psalm --taint-analysis --output-format=json $PHP_FILES > "$GITHUB_WORKSPACE/psalm-results.json" 2>&1 || true
+              echo "Psalm raw output:"
+              cat "$GITHUB_WORKSPACE/psalm-results.json" | head -c 1000
               cd "$GITHUB_WORKSPACE"
 
               if [ -f psalm-results.json ] && jq -e '.' psalm-results.json > /dev/null 2>&1; then
