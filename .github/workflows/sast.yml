@@ -75,8 +75,40 @@ jobs:
           fi
           echo "GoSec found: $GOSEC_COUNT issues"
 
+          # --- PSALM ---
+          echo "Running Psalm..."
+          PSALM_COUNT=0
+          CHANGED_PHP=$(git diff --name-only --diff-filter=ACM "$BASE_SHA" "$HEAD_SHA" -- '*.php' | grep -v '/vendor/' | grep -v '/node_modules/' || true)
+
+          if [ -n "$CHANGED_PHP" ]; then
+            PSALM_CONFIG=$(find "$GITHUB_WORKSPACE" -name "psalm.xml" -not -path "*/vendor/*" -not -path "*/node_modules/*" | head -1)
+
+            if [ -n "$PSALM_CONFIG" ]; then
+              PSALM_DIR=$(dirname "$PSALM_CONFIG")
+              cd "$PSALM_DIR"
+
+              if [ -f "composer.json" ] && [ ! -d "vendor" ]; then
+                composer install --no-progress --no-interaction 2>/dev/null || true
+              fi
+
+              PHP_FILES=""
+              for f in $CHANGED_PHP; do
+                relative=$(echo "$f" | sed "s|^${PSALM_DIR#$GITHUB_WORKSPACE/}/||")
+                PHP_FILES="$PHP_FILES $relative"
+              done
+
+              vendor/bin/psalm --taint-analysis --output-format=json $PHP_FILES 2>/dev/null > "$GITHUB_WORKSPACE/psalm-results.json" || true
+              cd "$GITHUB_WORKSPACE"
+
+              if [ -f psalm-results.json ] && jq -e '.' psalm-results.json > /dev/null 2>&1; then
+                PSALM_COUNT=$(jq 'if type == "array" then length else 0 end' psalm-results.json 2>/dev/null || echo "0")
+              fi
+            fi
+          fi
+          echo "Psalm found: $PSALM_COUNT issues"
+
           # --- BUILD COMMENT ---
-          TOTAL=$((SEMGREP_COUNT + GOSEC_COUNT))
+          TOTAL=$((SEMGREP_COUNT + GOSEC_COUNT + PSALM_COUNT))
           RESULT_FILE="sast-comment.md"
 
           echo "# SAST Scan Results" > "$RESULT_FILE"
@@ -132,8 +164,33 @@ jobs:
           fi
           echo "" >> "$RESULT_FILE"
 
+          # Psalm results
           echo "---" >> "$RESULT_FILE"
-          echo "**Total issues: $TOTAL** | Scanned using Semgrep + GoSec" >> "$RESULT_FILE"
+          if [ "$PSALM_COUNT" -gt 0 ]; then
+            echo "## Psalm (PHP taint analysis) — $PSALM_COUNT issue(s)" >> "$RESULT_FILE"
+            echo "" >> "$RESULT_FILE"
+            echo "| File | Line | What's Wrong | How to Fix |" >> "$RESULT_FILE"
+            echo "|---|---|---|---|" >> "$RESULT_FILE"
+            jq -r '(if type == "array" then . else [] end) | .[]? | "| `\(.file_name)` | \(.line_from) | \(.type): \(.message) | \(
+              if (.type | test("TaintedSql")) then "Use prepared statements: `$pdo->prepare(\"SELECT * WHERE id=?\")->execute([$id])`"
+              elif (.type | test("TaintedHtml|TaintedText")) then "Escape output: `htmlentities($var, ENT_QUOTES, \"UTF-8\")`"
+              elif (.type | test("TaintedShell")) then "Use `escapeshellarg()` to escape user input"
+              elif (.type | test("TaintedFile")) then "Use `basename()` to strip directory traversal"
+              elif (.type | test("TaintedUnserialize")) then "Use `json_decode()` instead of `unserialize()`"
+              elif (.type | test("TaintedSSRF")) then "Validate URL against allowlist before fetching"
+              else "Review this code for security issues"
+              end) |"' psalm-results.json >> "$RESULT_FILE"
+          elif [ -n "$CHANGED_PHP" ]; then
+            echo "## Psalm (PHP taint analysis) — 0 issue(s)" >> "$RESULT_FILE"
+            echo "" >> "$RESULT_FILE"
+            echo "No issues found." >> "$RESULT_FILE"
+          else
+            echo "## Psalm (PHP taint analysis) — Skipped (no PHP files changed)" >> "$RESULT_FILE"
+          fi
+          echo "" >> "$RESULT_FILE"
+
+          echo "---" >> "$RESULT_FILE"
+          echo "**Total issues: $TOTAL** | Scanned using Semgrep + GoSec + Psalm" >> "$RESULT_FILE"
 
           # --- POST COMMENT ---
           EXISTING=$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
