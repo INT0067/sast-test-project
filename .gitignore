@@ -1,0 +1,6 @@
+vendor/
+node_modules/
+*.sarif
+gosec-*.json
+psalm-local-results.json
+gosec-local-results.json
