@@ -17,32 +17,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Get changed files
-        id: changed
+      - name: Run SAST Scan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BRANCH: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          CHANGED_GO=$(git diff --name-only --diff-filter=ACM \
-            ${{ github.event.pull_request.base.sha }} \
-            ${{ github.event.pull_request.head.sha }} \
-            -- '*.go' || true)
-          CHANGED_PHP=$(git diff --name-only --diff-filter=ACM \
-            ${{ github.event.pull_request.base.sha }} \
-            ${{ github.event.pull_request.head.sha }} \
-            -- '*.php' | grep -v '/vendor/' | grep -v '/node_modules/' || true)
+          export PATH="$PATH:$HOME/go/bin"
 
-          if [ -n "$CHANGED_GO" ]; then
-            echo "has_go=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_go=false" >> "$GITHUB_OUTPUT"
-          fi
-          if [ -n "$CHANGED_PHP" ]; then
-            echo "has_php=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_php=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Run Semgrep
-        id: semgrep
-        run: |
+          # --- SEMGREP ---
+          echo "Running Semgrep..."
           semgrep scan \
             --config auto \
             --config p/owasp-top-ten \
@@ -50,103 +36,93 @@ jobs:
             --config p/golang \
             --config p/secrets \
             --json \
-            --baseline-commit ${{ github.event.pull_request.base.sha }} \
+            --baseline-commit "$BASE_SHA" \
             2>/dev/null > semgrep-results.json || true
 
           SEMGREP_COUNT=$(jq '.results | length' semgrep-results.json 2>/dev/null || echo "0")
-          echo "count=$SEMGREP_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Semgrep found: $SEMGREP_COUNT issues"
 
-      - name: Run GoSec
-        id: gosec
-        if: steps.changed.outputs.has_go == 'true'
-        run: |
-          export PATH="$PATH:$HOME/go/bin"
-          CHANGED_GO=$(git diff --name-only --diff-filter=ACM \
-            ${{ github.event.pull_request.base.sha }} \
-            ${{ github.event.pull_request.head.sha }} \
-            -- '*.go')
+          # --- GOSEC ---
+          echo "Running GoSec..."
+          GOSEC_COUNT=0
+          CHANGED_GO=$(git diff --name-only --diff-filter=ACM "$BASE_SHA" "$HEAD_SHA" -- '*.go' || true)
 
-          MODROOTS=""
-          for f in $CHANGED_GO; do
-            dir=$(dirname "$f")
-            while [ "$dir" != "." ]; do
-              if [ -f "$dir/go.mod" ]; then
-                MODROOTS="$MODROOTS $dir"
-                break
+          if [ -n "$CHANGED_GO" ]; then
+            MODROOTS=""
+            for f in $CHANGED_GO; do
+              dir=$(dirname "$f")
+              while [ "$dir" != "." ]; do
+                if [ -f "$dir/go.mod" ]; then
+                  MODROOTS="$MODROOTS $dir"
+                  break
+                fi
+                dir=$(dirname "$dir")
+              done
+              if [ -f "go.mod" ] && [ "$dir" = "." ]; then
+                MODROOTS="$MODROOTS ."
               fi
-              dir=$(dirname "$dir")
             done
-            if [ -f "go.mod" ] && [ "$dir" = "." ]; then
-              MODROOTS="$MODROOTS ."
+            MODROOTS=$(echo "$MODROOTS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+
+            for modroot in $MODROOTS; do
+              cd "$modroot"
+              go mod tidy 2>/dev/null
+              gosec -fmt json -out "$GITHUB_WORKSPACE/gosec-results.json" ./... 2>/dev/null || true
+              cd "$GITHUB_WORKSPACE"
+            done
+
+            GOSEC_COUNT=$(jq '.Issues | length' gosec-results.json 2>/dev/null || echo "0")
+          fi
+          echo "GoSec found: $GOSEC_COUNT issues"
+
+          # --- PSALM ---
+          echo "Running Psalm..."
+          PSALM_COUNT=0
+          CHANGED_PHP=$(git diff --name-only --diff-filter=ACM "$BASE_SHA" "$HEAD_SHA" -- '*.php' | grep -v '/vendor/' | grep -v '/node_modules/' || true)
+
+          if [ -n "$CHANGED_PHP" ]; then
+            PSALM_CONFIG=$(find "$GITHUB_WORKSPACE" -name "psalm.xml" -not -path "*/vendor/*" -not -path "*/node_modules/*" | head -1)
+
+            if [ -n "$PSALM_CONFIG" ]; then
+              PSALM_DIR=$(dirname "$PSALM_CONFIG")
+              cd "$PSALM_DIR"
+
+              if [ -f "composer.json" ] && [ ! -d "vendor" ]; then
+                composer install --no-progress --no-interaction 2>/dev/null || true
+              fi
+
+              PHP_FILES=""
+              for f in $CHANGED_PHP; do
+                relative=$(echo "$f" | sed "s|^${PSALM_DIR#$GITHUB_WORKSPACE/}/||")
+                PHP_FILES="$PHP_FILES $relative"
+              done
+
+              vendor/bin/psalm --taint-analysis --output-format=json $PHP_FILES 2>/dev/null > "$GITHUB_WORKSPACE/psalm-results.json" || true
+              cd "$GITHUB_WORKSPACE"
+
+              if [ -f psalm-results.json ] && jq -e '.' psalm-results.json > /dev/null 2>&1; then
+                PSALM_COUNT=$(jq 'if type == "array" then length else 0 end' psalm-results.json 2>/dev/null || echo "0")
+              fi
             fi
-          done
-          MODROOTS=$(echo "$MODROOTS" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+          fi
+          echo "Psalm found: $PSALM_COUNT issues"
 
-          for modroot in $MODROOTS; do
-            cd "$modroot"
-            go mod tidy 2>/dev/null
-            gosec -fmt json -out "$GITHUB_WORKSPACE/gosec-results.json" ./... 2>/dev/null || true
-            cd "$GITHUB_WORKSPACE"
-          done
-
-          GOSEC_COUNT=$(jq '.Issues | length' gosec-results.json 2>/dev/null || echo "0")
-          echo "count=$GOSEC_COUNT" >> "$GITHUB_OUTPUT"
-
-      - name: Build and post PR comment
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          BRANCH: ${{ github.head_ref }}
-        run: |
+          # --- BUILD COMMENT ---
+          TOTAL=$((SEMGREP_COUNT + GOSEC_COUNT + PSALM_COUNT))
           RESULT_FILE="sast-comment.md"
-          SEMGREP_COUNT=${{ steps.semgrep.outputs.count || '0' }}
-          GOSEC_COUNT=${{ steps.gosec.outputs.count || '0' }}
-          TOTAL=$((SEMGREP_COUNT + GOSEC_COUNT))
-
-          # Create fix suggestions helper
-          cat > /tmp/fix-helper.jq << 'JQEOF'
-          def fix_suggestion:
-            if .check_id then
-              # Semgrep rules
-              if (.check_id | test("sql|sqli")) then "Use parameterized queries: `db.Query(\"SELECT * FROM t WHERE id = ?\", id)` (Go) or `$pdo->prepare()` (PHP)"
-              elif (.check_id | test("exec|command")) then "Never pass user input to shell. Use `exec.Command(\"cmd\", arg1, arg2)` (Go) or `escapeshellarg()` (PHP)"
-              elif (.check_id | test("echo|xss|fprintf.*response")) then "Escape output before displaying: `html/template` (Go) or `htmlentities()` (PHP)"
-              elif (.check_id | test("tls|ssl|verify")) then "Remove `InsecureSkipVerify: true` and set `MinVersion: tls.VersionTLS13`"
-              elif (.check_id | test("md5|sha1|weak_crypto")) then "Use `crypto/sha256` instead of `crypto/md5`"
-              elif (.check_id | test("unserialize")) then "Replace `unserialize()` with `json_decode()`"
-              elif (.check_id | test("tainted-filename|file")) then "Use `basename()` to strip directory traversal from user input"
-              elif (.check_id | test("secret|credential|password")) then "Move secrets to environment variables: `os.Getenv()` (Go) or `getenv()` (PHP)"
-              else "Review this code for security issues"
-              end
-            else
-              # GoSec rules
-              if (.rule_id == "G701" or .rule_id == "G202") then "Use parameterized queries: `db.Query(\"SELECT * FROM t WHERE id = ?\", id)`"
-              elif (.rule_id == "G702" or .rule_id == "G204") then "Never pass user input to shell. Use `exec.Command(\"cmd\", arg1, arg2)` without `sh -c`"
-              elif (.rule_id == "G705") then "Use `html/template` package instead of `fmt.Fprintf` to write to ResponseWriter"
-              elif (.rule_id == "G402") then "Remove `InsecureSkipVerify: true` and set `MinVersion: tls.VersionTLS13`"
-              elif (.rule_id == "G401" or .rule_id == "G501") then "Use `crypto/sha256` instead of `crypto/md5`"
-              elif (.rule_id == "G101") then "Move secrets to environment variables: `os.Getenv(\"SECRET_KEY\")`"
-              elif (.rule_id == "G114") then "Use `http.Server{ReadTimeout: 5*time.Second, WriteTimeout: 10*time.Second}` instead of `http.ListenAndServe`"
-              elif (.rule_id == "G404") then "Use `crypto/rand` instead of `math/rand` for security-sensitive operations"
-              else "Review this code for security issues"
-              end
-            end;
-          JQEOF
 
           echo "# SAST Scan Results" > "$RESULT_FILE"
           echo "" >> "$RESULT_FILE"
           echo "**Branch:** \`$BRANCH\` | **PR:** #$PR_NUMBER | **Scanned at:** $(date '+%Y-%m-%d %H:%M:%S')" >> "$RESULT_FILE"
           echo "" >> "$RESULT_FILE"
 
-          # Semgrep results with fix suggestions
+          # Semgrep results
           echo "---" >> "$RESULT_FILE"
           echo "## Semgrep (PHP + Go) — $SEMGREP_COUNT issue(s)" >> "$RESULT_FILE"
           echo "" >> "$RESULT_FILE"
           if [ "$SEMGREP_COUNT" -gt 0 ]; then
             echo "| File | Line | Severity | What's Wrong | How to Fix |" >> "$RESULT_FILE"
             echo "|---|---|---|---|---|" >> "$RESULT_FILE"
-            jq -r 'include "/tmp/fix-helper"; .results[]? | "| `\(.path)` | \(.start.line) | \(.extra.severity) | \(.extra.message | split("\n") | first | .[0:60]) | \(fix_suggestion) |"' semgrep-results.json >> "$RESULT_FILE" 2>/dev/null || \
             jq -r '.results[]? | "| `\(.path)` | \(.start.line) | \(.extra.severity) | \(.extra.message | split("\n") | first | .[0:60]) | \(
               if (.check_id | test("sql|sqli")) then "Use parameterized queries with `?` placeholder"
               elif (.check_id | test("exec|command")) then "Never pass user input to shell directly"
@@ -162,38 +138,63 @@ jobs:
           fi
           echo "" >> "$RESULT_FILE"
 
-          # GoSec results with fix suggestions
+          # GoSec results
           echo "---" >> "$RESULT_FILE"
-          if [ -f gosec-results.json ]; then
+          if [ -f gosec-results.json ] && [ "$GOSEC_COUNT" -gt 0 ]; then
             echo "## GoSec (Go specialist) — $GOSEC_COUNT issue(s)" >> "$RESULT_FILE"
             echo "" >> "$RESULT_FILE"
-            if [ "$GOSEC_COUNT" -gt 0 ]; then
-              echo "| File | Line | Severity | What's Wrong | How to Fix |" >> "$RESULT_FILE"
-              echo "|---|---|---|---|---|" >> "$RESULT_FILE"
-              jq -r '.Issues[]? | "| `\(.file | split("/") | .[-2:] | join("/"))` | \(.line) | \(.severity) | \(.details) | \(
-                if (.rule_id == "G701" or .rule_id == "G202") then "Use `db.Query(\"SELECT * FROM t WHERE id = ?\", id)` — parameterized query"
-                elif (.rule_id == "G702" or .rule_id == "G204") then "Use `exec.Command(\"cmd\", arg1, arg2)` — no shell, pass args directly"
-                elif (.rule_id == "G705") then "Use `html/template` package instead of `fmt.Fprintf` to ResponseWriter"
-                elif (.rule_id == "G402") then "Remove `InsecureSkipVerify: true`, add `MinVersion: tls.VersionTLS13`"
-                elif (.rule_id == "G401" or .rule_id == "G501") then "Use `crypto/sha256` instead of `crypto/md5`"
-                elif (.rule_id == "G101") then "Move secrets to env vars: `os.Getenv(\"SECRET_KEY\")`"
-                elif (.rule_id == "G114") then "Use `http.Server{ReadTimeout: 5*time.Second}` instead of `http.ListenAndServe`"
-                else "Review this code for security issues"
-                end) |"' gosec-results.json >> "$RESULT_FILE"
-            else
-              echo "No issues found." >> "$RESULT_FILE"
-            fi
+            echo "| File | Line | Severity | What's Wrong | How to Fix |" >> "$RESULT_FILE"
+            echo "|---|---|---|---|---|" >> "$RESULT_FILE"
+            jq -r '.Issues[]? | "| `\(.file | split("/") | .[-2:] | join("/"))` | \(.line) | \(.severity) | \(.details) | \(
+              if (.rule_id == "G701" or .rule_id == "G202") then "Use `db.Query(\"SELECT * FROM t WHERE id = ?\", id)`"
+              elif (.rule_id == "G702" or .rule_id == "G204") then "Use `exec.Command(\"cmd\", arg1, arg2)` — no shell"
+              elif (.rule_id == "G705") then "Use `html/template` instead of `fmt.Fprintf`"
+              elif (.rule_id == "G402") then "Remove `InsecureSkipVerify`, add `MinVersion: tls.VersionTLS13`"
+              elif (.rule_id == "G401" or .rule_id == "G501") then "Use `crypto/sha256` instead of `crypto/md5`"
+              elif (.rule_id == "G101") then "Move secrets to env vars: `os.Getenv(\"KEY\")`"
+              elif (.rule_id == "G114") then "Use `http.Server{ReadTimeout: 5*time.Second}`"
+              else "Review this code for security issues"
+              end) |"' gosec-results.json >> "$RESULT_FILE"
+          elif [ -n "$CHANGED_GO" ]; then
+            echo "## GoSec (Go specialist) — 0 issue(s)" >> "$RESULT_FILE"
+            echo "" >> "$RESULT_FILE"
+            echo "No issues found." >> "$RESULT_FILE"
           else
             echo "## GoSec (Go specialist) — Skipped (no Go files changed)" >> "$RESULT_FILE"
           fi
           echo "" >> "$RESULT_FILE"
 
+          # Psalm results
           echo "---" >> "$RESULT_FILE"
-          echo "**Total issues: $TOTAL** | Scanned using Semgrep + GoSec" >> "$RESULT_FILE"
+          if [ "$PSALM_COUNT" -gt 0 ]; then
+            echo "## Psalm (PHP taint analysis) — $PSALM_COUNT issue(s)" >> "$RESULT_FILE"
+            echo "" >> "$RESULT_FILE"
+            echo "| File | Line | What's Wrong | How to Fix |" >> "$RESULT_FILE"
+            echo "|---|---|---|---|" >> "$RESULT_FILE"
+            jq -r '(if type == "array" then . else [] end) | .[]? | "| `\(.file_name)` | \(.line_from) | \(.type): \(.message) | \(
+              if (.type | test("TaintedSql")) then "Use prepared statements: `$pdo->prepare(\"SELECT * WHERE id=?\")->execute([$id])`"
+              elif (.type | test("TaintedHtml|TaintedText")) then "Escape output: `htmlentities($var, ENT_QUOTES, \"UTF-8\")`"
+              elif (.type | test("TaintedShell")) then "Use `escapeshellarg()` to escape user input"
+              elif (.type | test("TaintedFile")) then "Use `basename()` to strip directory traversal"
+              elif (.type | test("TaintedUnserialize")) then "Use `json_decode()` instead of `unserialize()`"
+              elif (.type | test("TaintedSSRF")) then "Validate URL against allowlist before fetching"
+              else "Review this code for security issues"
+              end) |"' psalm-results.json >> "$RESULT_FILE"
+          elif [ -n "$CHANGED_PHP" ]; then
+            echo "## Psalm (PHP taint analysis) — 0 issue(s)" >> "$RESULT_FILE"
+            echo "" >> "$RESULT_FILE"
+            echo "No issues found." >> "$RESULT_FILE"
+          else
+            echo "## Psalm (PHP taint analysis) — Skipped (no PHP files changed)" >> "$RESULT_FILE"
+          fi
+          echo "" >> "$RESULT_FILE"
 
-          # Post or update comment
+          echo "---" >> "$RESULT_FILE"
+          echo "**Total issues: $TOTAL** | Scanned using Semgrep + GoSec + Psalm" >> "$RESULT_FILE"
+
+          # --- POST COMMENT ---
           EXISTING=$(gh api "repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
-            --jq '.[] | select(.body | startswith("# SAST Scan Results")) | .id' | tail -1)
+            --jq '.[] | select(.body | startswith("# SAST Scan Results")) | .id' | tail -1 || true)
 
           if [ -n "$EXISTING" ]; then
             gh api "repos/${{ github.repository }}/issues/comments/$EXISTING" \
@@ -202,7 +203,7 @@ jobs:
             gh pr comment "$PR_NUMBER" --body "$(cat "$RESULT_FILE")"
           fi
 
-          # Generate annotations on code lines (after comment, so they don't appear in comment)
+          # --- ANNOTATIONS ---
           if [ "$SEMGREP_COUNT" -gt 0 ]; then
             jq -r '.results[]? | "::error file=\(.path),line=\(.start.line)::Semgrep [\(.check_id | split(".") | last)]: \(.extra.message | split("\n") | first | .[0:200])"' semgrep-results.json
           fi
@@ -211,7 +212,7 @@ jobs:
             jq -r --arg ws "$WORKSPACE" '.Issues[]? | "::error file=\(.file | gsub($ws; "")),line=\(.line)::GoSec [\(.rule_id)]: \(.details)"' gosec-results.json
           fi
 
-          # Fail the check if issues found
+          # --- FAIL IF ISSUES ---
           if [ "$TOTAL" -gt 0 ]; then
             exit 1
           fi
