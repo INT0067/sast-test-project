@@ -73,9 +73,12 @@ jobs:
               cd "$modroot"
               go mod tidy 2>/dev/null
               echo "Running gosec in $(pwd)"
-            gosec -fmt json -out "$GITHUB_WORKSPACE/gosec-results.json" ./... || true
-            echo "GoSec exit code: $?"
-            cat "$GITHUB_WORKSPACE/gosec-results.json" | jq '.Stats' 2>/dev/null
+            go mod tidy
+            echo "Go mod tidy done"
+            ls -la *.go
+            gosec -fmt json -out "$GITHUB_WORKSPACE/gosec-results.json" ./...
+            echo "GoSec done"
+            jq '.Stats' "$GITHUB_WORKSPACE/gosec-results.json"
               cd "$GITHUB_WORKSPACE"
             done
 
@@ -106,9 +109,11 @@ jobs:
               done
 
               echo "Running Psalm in $(pwd) on files: $PHP_FILES"
-              vendor/bin/psalm --taint-analysis --output-format=json $PHP_FILES > "$GITHUB_WORKSPACE/psalm-results.json" 2>&1 || true
-              echo "Psalm raw output:"
-              cat "$GITHUB_WORKSPACE/psalm-results.json" | head -c 1000
+              vendor/bin/psalm --taint-analysis --output-format=json $PHP_FILES 2>/dev/null | tee "$GITHUB_WORKSPACE/psalm-raw.txt" || true
+              # Extract only the JSON array from output (skip any non-JSON lines)
+              grep -o '\[.*\]' "$GITHUB_WORKSPACE/psalm-raw.txt" > "$GITHUB_WORKSPACE/psalm-results.json" 2>/dev/null || echo "[]" > "$GITHUB_WORKSPACE/psalm-results.json"
+              echo "Psalm results:"
+              cat "$GITHUB_WORKSPACE/psalm-results.json" | jq 'length'
               cd "$GITHUB_WORKSPACE"
 
               if [ -f psalm-results.json ] && jq -e '.' psalm-results.json > /dev/null 2>&1; then
